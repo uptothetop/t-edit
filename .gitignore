@@ -39,3 +39,22 @@
 
 # debug information files
 *.dwo
+
+# CMake and build directories
+build*/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+compile_commands.json
+
+# IDE / OS specific
+.DS_Store
+.vscode/
+.idea/
+
+# Project executables
+GapBufferTests
+t-edit-demo
