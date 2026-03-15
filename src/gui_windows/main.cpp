@@ -27,7 +27,10 @@ class MainWindow {
     IDWriteFactory *m_pDWriteFactory;
     IDWriteTextFormat *m_pTextFormat;
 
+    IDWriteTextLayout *m_pTextLayout;
+    
     GapBuffer m_buffer;
+    float m_scrollY;
 
     HRESULT CreateGraphicsResources() {
         HRESULT hr = S_OK;
@@ -44,7 +47,6 @@ class MainWindow {
                 &m_pRenderTarget);
 
             if (FAILED(hr)) {
-                // Fallback to software rendering (useful for Wine or weak VMs)
                 props.type = D2D1_RENDER_TARGET_TYPE_SOFTWARE;
                 hr = m_pDirect2dFactory->CreateHwndRenderTarget(
                     props,
@@ -54,12 +56,13 @@ class MainWindow {
 
             if (SUCCEEDED(hr)) {
                 hr = m_pRenderTarget->CreateSolidColorBrush(
-                    D2D1::ColorF(D2D1::ColorF::LightSlateGray),
+                    D2D1::ColorF(0x2d2d2d), // Dark text
                     &m_pLightSlateGrayBrush);
             }
             if (SUCCEEDED(hr)) {
+                // Change caret color to blue
                 hr = m_pRenderTarget->CreateSolidColorBrush(
-                    D2D1::ColorF(D2D1::ColorF::CornflowerBlue),
+                    D2D1::ColorF(0x0078d7), 
                     &m_pCornflowerBlueBrush);
             }
         }
@@ -71,6 +74,44 @@ class MainWindow {
         SafeRelease(&m_pLightSlateGrayBrush);
         SafeRelease(&m_pCornflowerBlueBrush);
     }
+    
+    void RecreateTextLayout() {
+        SafeRelease(&m_pTextLayout);
+        
+        RECT rc;
+        GetClientRect(m_hwnd, &rc);
+        float width = static_cast<float>(rc.right - rc.left) - 20.0f;
+        if (width <= 0) width = 1.0f;
+        
+        std::string text = m_buffer.get_text();
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, &text[0], (int)text.size(), NULL, 0);
+        std::wstring wstrTo(size_needed, 0);
+        MultiByteToWideChar(CP_UTF8, 0, &text[0], (int)text.size(), &wstrTo[0], size_needed);
+        
+        // Always ensure at least a space if empty so layout doesn't completely fail
+        if (wstrTo.empty()) wstrTo = L" ";
+
+        m_pDWriteFactory->CreateTextLayout(
+            wstrTo.c_str(),
+            wstrTo.length(),
+            m_pTextFormat,
+            width,
+            100000.0f, // large height to allow infinite scrolling
+            &m_pTextLayout
+        );
+    }
+
+    void EnsureCursorVisible(float caretY, float caretHeight, float viewHeight) {
+        float effectiveY = caretY + m_scrollY;
+        
+        if (effectiveY < 0) {
+            // Cursor is above view
+            m_scrollY += (-effectiveY) + 10.0f; // pad
+        } else if (effectiveY + caretHeight > viewHeight) {
+            // Cursor is below view
+            m_scrollY -= (effectiveY + caretHeight - viewHeight) + 10.0f;
+        }
+    }
 
     void OnPaint() {
         HRESULT hr = CreateGraphicsResources();
@@ -79,44 +120,45 @@ class MainWindow {
             BeginPaint(m_hwnd, &ps);
 
             m_pRenderTarget->BeginDraw();
-            m_pRenderTarget->Clear(D2D1::ColorF(D2D1::ColorF::White));
+            m_pRenderTarget->Clear(D2D1::ColorF(0xf9f9f9)); // Light gray background
 
             RECT rc;
             GetClientRect(m_hwnd, &rc);
-
-            std::string text = m_buffer.get_text();
             
-            // Convert to UTF-16
-            int size_needed = MultiByteToWideChar(CP_UTF8, 0, &text[0], (int)text.size(), NULL, 0);
-            std::wstring wstrTo(size_needed, 0);
-            MultiByteToWideChar(CP_UTF8, 0, &text[0], (int)text.size(), &wstrTo[0], size_needed);
+            RecreateTextLayout();
 
-            D2D1_RECT_F layoutRect = D2D1::RectF(
-                static_cast<FLOAT>(rc.left) + 10,
-                static_cast<FLOAT>(rc.top) + 10,
-                static_cast<FLOAT>(rc.right) - 10,
-                static_cast<FLOAT>(rc.bottom) - 10
-            );
+            if (m_pTextLayout) {
+                // Calculate cursor position
+                size_t cursorPos = m_buffer.cursor_pos();
+                std::string text = m_buffer.get_text();
+                // Map byte position back to UTF-16 index
+                int w16_len = MultiByteToWideChar(CP_UTF8, 0, &text[0], (int)cursorPos, NULL, 0);
+                
+                FLOAT caretX = 0, caretY = 0;
+                DWRITE_HIT_TEST_METRICS metrics;
+                // If the user presses right at the end of a wrapped line, HitTest returns coordinates.
+                m_pTextLayout->HitTestTextPosition(w16_len, FALSE, &caretX, &caretY, &metrics);
+                
+                // Track cursor 
+                EnsureCursorVisible(caretY, metrics.height, static_cast<float>(rc.bottom - rc.top - 20));
 
-            if (!wstrTo.empty()) {
-                m_pRenderTarget->DrawText(
-                    wstrTo.c_str(),
-                    wstrTo.length(),
-                    m_pTextFormat,
-                    layoutRect,
-                    m_pLightSlateGrayBrush
+                D2D1_POINT_2F origin = D2D1::Point2F(10.0f, 10.0f + m_scrollY);
+                m_pRenderTarget->DrawTextLayout(origin, m_pTextLayout, m_pLightSlateGrayBrush);
+
+                // Draw Caret
+                D2D1_RECT_F caretRect = D2D1::RectF(
+                    origin.x + caretX,
+                    origin.y + caretY,
+                    origin.x + caretX + 2.0f,
+                    origin.y + caretY + metrics.height
                 );
+                
+                // Blink logic based on GetTickCount
+                if ((GetTickCount() / 500) % 2 == 0) {
+                    m_pRenderTarget->FillRectangle(&caretRect, m_pCornflowerBlueBrush);
+                }
             }
 
-            // Draw cursor (simple representation)
-            size_t cursorPos = m_buffer.cursor_pos();
-            int subStrSize = MultiByteToWideChar(CP_UTF8, 0, &text[0], (int)cursorPos, NULL, 0);
-            std::wstring subStr(subStrSize, 0);
-            MultiByteToWideChar(CP_UTF8, 0, &text[0], (int)cursorPos, &subStr[0], subStrSize);
-
-            // Approximate cursor position (DirectWrite provides better APIs for hit testing, this is naive)
-            // But sufficient for very first draft. We will need IDWriteTextLayout to do it perfectly.
-            
             hr = m_pRenderTarget->EndDraw();
             if (hr == D2DERR_RECREATE_TARGET) {
                 hr = S_OK;
@@ -132,19 +174,19 @@ class MainWindow {
             GetClientRect(m_hwnd, &rc);
             D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
             m_pRenderTarget->Resize(size);
+            RecreateTextLayout(); // Wrap needs to be recalculated based on new width
         }
     }
 
 public:
     MainWindow() : m_hwnd(NULL), m_pDirect2dFactory(NULL), m_pRenderTarget(NULL),
                    m_pLightSlateGrayBrush(NULL), m_pCornflowerBlueBrush(NULL),
-                   m_pDWriteFactory(NULL), m_pTextFormat(NULL) {
-        m_buffer.insert_char('H');
-        m_buffer.insert_char('i');
-        m_buffer.insert_char('!');
+                   m_pDWriteFactory(NULL), m_pTextFormat(NULL), m_pTextLayout(NULL), m_scrollY(0) {
+        
     }
 
     ~MainWindow() {
+        SafeRelease(&m_pTextLayout);
         SafeRelease(&m_pDirect2dFactory);
         SafeRelease(&m_pDWriteFactory);
         SafeRelease(&m_pTextFormat);
@@ -167,10 +209,14 @@ public:
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                20.0f,
+                16.0f,
                 L"en-us",
                 &m_pTextFormat
             );
+            if (SUCCEEDED(hr)) {
+                // Enable Word Wrapping
+                m_pTextFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            }
         }
 
         WNDCLASS wc = {0};
@@ -189,6 +235,8 @@ public:
             CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
             NULL, NULL, GetModuleHandle(NULL), this
         );
+        
+        SetTimer(m_hwnd, 1, 500, NULL); // Timer for blinking cursor
 
         return m_hwnd ? S_OK : E_FAIL;
     }
@@ -217,13 +265,23 @@ public:
                 case WM_PAINT:
                     pThis->OnPaint();
                     return 0;
+                case WM_TIMER:
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                case WM_MOUSEWHEEL: {
+                    short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+                    pThis->m_scrollY += zDelta * 0.5f;
+                    if (pThis->m_scrollY > 0) pThis->m_scrollY = 0; // Don't scroll above top
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
                 case WM_CHAR: {
                     if (wParam == '\b') {
                         // handled in WM_KEYDOWN
                     } else if (wParam == '\r') {
                         pThis->m_buffer.insert_char('\n');
                         InvalidateRect(hwnd, NULL, FALSE);
-                    } else if (wParam >= 32) {
+                    } else if (wParam >= 32 || wParam == '\t') {
                         // Needs proper UTF-8 handling ideally, but simple char for now
                         pThis->m_buffer.insert_char((char)wParam);
                         InvalidateRect(hwnd, NULL, FALSE);
@@ -251,6 +309,7 @@ public:
                     return 0;
                 }
                 case WM_DESTROY:
+                    KillTimer(hwnd, 1);
                     PostQuitMessage(0);
                     return 0;
             }
